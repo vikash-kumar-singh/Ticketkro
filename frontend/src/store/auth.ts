@@ -1,0 +1,3 @@
+import { create } from 'zustand'; import { persist } from 'zustand/middleware'; import type { User } from '../types';
+type AuthState={user:User|null;accessToken:string|null;refreshToken:string|null;setAuth:(user:User,tokens:{accessToken:string;refreshToken:string})=>void;setAccessToken:(v:string)=>void;logout:()=>void};
+export const useAuth=create<AuthState>()(persist((set)=>({user:null,accessToken:null,refreshToken:null,setAuth:(user,tokens)=>set({user,...tokens}),setAccessToken:(accessToken)=>set({accessToken}),logout:()=>set({user:null,accessToken:null,refreshToken:null})}),{name:'tms-auth'}));
