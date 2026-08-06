@@ -1,5 +1,5 @@
 import { MANAGER_ROLES } from '../constants/index.js';
-import { AuditLog, Notification, Ticket, TicketComment, TicketHistory, User } from '../models/index.js';
+import { AuditLog, mongoose, Notification, Ticket, TicketComment, TicketHistory, User } from '../models/index.js';
 import { AppError, ticketNumber } from '../utils/index.js';
 
 const scoped = (user: Express.Request['user']) => {
@@ -55,19 +55,39 @@ export const ticketService = {
     return Ticket.findById(ticket._id).populate('createdBy assignedTo', 'name email role department');
   },
   async update(id: string, input: any, user: NonNullable<Express.Request['user']>) {
-    const ticket = await Ticket.findOne({ _id: id, ...scoped(user) }); if (!ticket) throw new AppError(404, 'Ticket not found');
+    const ticket = await Ticket.findOne({ _id: id, ...scoped(user) });
+    if (!ticket) throw new AppError(404, 'Ticket not found');
     const managerial = MANAGER_ROLES.includes(user.role);
     const isCreator = ticket.createdBy.toString() === user.id;
     const isAssignee = ticket.assignedTo?.toString() === user.id;
     if (!managerial && !isCreator && !isAssignee) throw new AppError(403, 'Ticket cannot be changed');
-    if (!managerial && isAssignee && input.status && !['in_progress', 'pending', 'escalated', 'resolved'].includes(input.status)) throw new AppError(422, 'Assigned users can only start, pause, escalate, or resolve tickets', 'INVALID_STATUS');
+
+    const transferring = Boolean(input.assignedTo && input.assignedTo !== ticket.assignedTo?.toString());
+    let transferTarget = null;
+    if (transferring) {
+      if (!managerial && !isAssignee) throw new AppError(403, 'Only the current assignee or management can transfer this ticket', 'TRANSFER_FORBIDDEN');
+      if (!mongoose.isValidObjectId(input.assignedTo)) throw new AppError(422, 'Invalid transfer assignee', 'INVALID_ASSIGNEE');
+      if (input.assignedTo === user.id) throw new AppError(422, 'Choose another user for the transfer', 'INVALID_ASSIGNEE');
+      const companyScope = user.companyId ? { companyId: user.companyId } : {};
+      transferTarget = await User.findOne({ _id: input.assignedTo, isActive: true, ...companyScope });
+      if (!transferTarget) throw new AppError(422, 'The selected transfer user is not active or available', 'INVALID_ASSIGNEE');
+      input.department = transferTarget.department;
+      input.status = 'assigned';
+    }
+
+    if (!transferring && !managerial && isAssignee && input.status && !['in_progress', 'pending', 'escalated', 'resolved'].includes(input.status)) throw new AppError(422, 'Assigned users can only start, pause, escalate, or resolve tickets', 'INVALID_STATUS');
     if (!managerial && isCreator && !isAssignee && !['open', 'resolved'].includes(ticket.status)) throw new AppError(403, 'Only the assigned handler can update work in progress');
-    const allowed = managerial ? ['title','description','category','department','priority','status','assignedTo','dueDate'] : isAssignee ? ['status'] : ['title','description','feedback','status'];
-    const before = ticket.toObject(); for (const key of allowed) if (input[key] !== undefined) ticket.set(key, input[key]);
-    if (input.status === 'resolved') ticket.resolvedAt = new Date(); if (input.status === 'closed') ticket.closedAt = new Date(); await ticket.save();
-    await TicketHistory.create({ ticketId: id, actor: user.id, action: 'ticket.updated', from: before, to: ticket.toObject() });
-    if (ticket.assignedTo) await Notification.create({ userId: ticket.assignedTo, title: 'Ticket updated', message: `${ticket.ticketNumber}: ${ticket.title}`, link: `/tickets/${id}` });
-    return ticket;
+    const allowed = managerial ? ['title','description','category','department','priority','status','assignedTo','dueDate'] : isAssignee ? ['status','assignedTo','department'] : ['title','description','feedback','status'];
+    const before = ticket.toObject();
+    for (const key of allowed) if (input[key] !== undefined) ticket.set(key, input[key]);
+    if (input.status === 'resolved') ticket.resolvedAt = new Date();
+    if (input.status === 'closed') ticket.closedAt = new Date();
+    await ticket.save();
+    const action = transferring ? 'ticket.reassigned' : 'ticket.updated';
+    await TicketHistory.create({ ticketId: id, actor: user.id, action, from: before, to: ticket.toObject() });
+    await AuditLog.create({ companyId: user.companyId, actor: user.id, action, resource: 'ticket', resourceId: ticket.id, metadata: transferring ? { from: before.assignedTo, assignedTo: ticket.assignedTo, department: ticket.department } : undefined });
+    if (ticket.assignedTo) await Notification.create({ userId: ticket.assignedTo, title: transferring ? 'Ticket transferred to you' : 'Ticket updated', message: `${ticket.ticketNumber}: ${ticket.title}`, link: `/tickets/${id}` });
+    return Ticket.findById(ticket._id).populate('createdBy assignedTo', 'name email role department');
   },
   async comment(id: string, body: string, internal: boolean, user: NonNullable<Express.Request['user']>) {
     const ticket = await Ticket.findOne({ _id: id, ...scoped(user) }); if (!ticket) throw new AppError(404, 'Ticket not found');
