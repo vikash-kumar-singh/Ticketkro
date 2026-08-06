@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Check, Search, ShieldCheck, UserCheck, UserX } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { api } from '../api/client';
+import { DEPARTMENTS } from '../constants';
 import { useAuth } from '../store/auth';
 import type { ApiResponse, Role, User } from '../types';
 
@@ -19,7 +20,7 @@ function UserRow({ user }: { user: User }) {
   return <tr className="border-b border-slate-100 align-middle hover:bg-slate-50/70">
     <td className="px-4 py-4"><div className="flex items-center gap-3"><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-indigo-100 font-bold text-brand">{user.name.split(' ').map(v => v[0]).slice(0, 2).join('')}</div><div><p className="font-semibold">{user.name}{isSelf && <span className="ml-2 text-xs font-normal text-brand">You</span>}</p><p className="text-xs text-slate-500">{user.email}</p></div></div></td>
     <td className="px-4 py-4"><select className="field min-w-40" value={role} onChange={e => setRole(e.target.value as Role)} disabled={isSelf || update.isPending}>{roles.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</select></td>
-    <td className="px-4 py-4"><input className="field min-w-32" value={department} onChange={e => setDepartment(e.target.value)} disabled={update.isPending} /></td>
+    <td className="px-4 py-4"><select className="field min-w-40" value={department} onChange={e => setDepartment(e.target.value)} disabled={update.isPending}><option value="general">General</option>{DEPARTMENTS.map(item => <option key={item.value} value={item.value}>{item.label}</option>)}</select></td>
     <td className="px-4 py-4"><span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-semibold ${user.isActive ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{user.isActive ? <UserCheck size={13} /> : <UserX size={13} />}{user.isActive ? 'Active' : 'Disabled'}</span></td>
     <td className="px-4 py-4"><div className="flex justify-end gap-2"><button className="btn-secondary px-3" disabled={isSelf || update.isPending} onClick={() => update.mutate({ isActive: !user.isActive })}>{user.isActive ? 'Disable' : 'Activate'}</button><button className="btn-primary px-3" disabled={!changed || update.isPending} onClick={() => update.mutate({ role, department })}><Check size={15} />{update.isPending ? 'Saving…' : 'Save'}</button></div>{update.isError && <p className="mt-1 text-right text-xs text-rose-600">{(update.error as any).response?.data?.error?.message || 'Update failed'}</p>}</td>
   </tr>;

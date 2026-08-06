@@ -5,7 +5,7 @@ import { AppError, ticketNumber } from '../utils/index.js';
 const scoped = (user: Express.Request['user']) => {
   if (!user) throw new AppError(401, 'Authentication required');
   const query: Record<string, unknown> = user.companyId ? { companyId: user.companyId } : {};
-  if (user.role === 'employee') query.createdBy = user.id;
+  if (user.role === 'employee') query.$or = [{ createdBy: user.id }, { assignedTo: user.id }];
   if (user.role === 'hr') query.department = 'hr';
   return query;
 };
@@ -22,25 +22,33 @@ export const ticketService = {
   async get(id: string, user: Express.Request['user']) {
     const ticket = await Ticket.findOne({ _id: id, ...scoped(user) }).populate('createdBy assignedTo', 'name email role department');
     if (!ticket) throw new AppError(404, 'Ticket not found', 'TICKET_NOT_FOUND');
-    const [comments, history] = await Promise.all([TicketComment.find({ ticketId: id, ...(user?.role === 'employee' && { internal: false }) }).populate('author', 'name role').sort({ createdAt: 1 }), TicketHistory.find({ ticketId: id }).populate('actor', 'name').sort({ createdAt: 1 })]);
+    const assignedHandler = user?.role === 'employee' && ticket.assignedTo && ticket.assignedTo.toString() === user.id;
+    const [comments, history] = await Promise.all([TicketComment.find({ ticketId: id, ...(user?.role === 'employee' && !assignedHandler && { internal: false }) }).populate('author', 'name role').sort({ createdAt: 1 }), TicketHistory.find({ ticketId: id }).populate('actor', 'name').sort({ createdAt: 1 })]);
     return { ticket, comments, history };
   },
   async create(input: any, user: NonNullable<Express.Request['user']>) {
     const department = input.department || ({ hr: 'hr', payroll: 'finance', software: 'it', hardware: 'it', security: 'it' } as Record<string, string>)[input.category] || input.category;
-    const adminScope: Record<string, unknown> = { role: 'super_admin', isActive: true };
-    if (user.companyId) adminScope.companyId = user.companyId;
-    const superAdmin = await User.findOne(adminScope).sort({ createdAt: 1 });
-    const status = superAdmin ? 'assigned' : 'open';
-    const ticket = await Ticket.create({ ...input, department, status, assignedTo: superAdmin?._id, ticketNumber: ticketNumber(), createdBy: user.id, companyId: user.companyId });
+    const companyScope = user.companyId ? { companyId: user.companyId } : {};
+    let assignee = null;
+    let assignmentAction = 'ticket.auto_assigned';
+    if (input.assignedTo) {
+      assignee = await User.findOne({ _id: input.assignedTo, department, isActive: true, ...companyScope });
+      if (!assignee) throw new AppError(422, 'Selected assignee is not active or does not belong to this department', 'INVALID_ASSIGNEE');
+      assignmentAction = 'ticket.assigned_by_requester';
+    } else {
+      assignee = await User.findOne({ role: 'super_admin', isActive: true, ...companyScope }).sort({ createdAt: 1 });
+    }
+    const status = assignee ? 'assigned' : 'open';
+    const ticket = await Ticket.create({ ...input, department, status, assignedTo: assignee?._id, ticketNumber: ticketNumber(), createdBy: user.id, companyId: user.companyId });
     const work: Promise<unknown>[] = [
       TicketHistory.create({ ticketId: ticket._id, actor: user.id, action: 'ticket.created', to: { status } }),
       AuditLog.create({ companyId: user.companyId, actor: user.id, action: 'ticket.created', resource: 'ticket', resourceId: ticket.id }),
     ];
-    if (superAdmin) {
+    if (assignee) {
       work.push(
-        TicketHistory.create({ ticketId: ticket._id, actor: user.id, action: 'ticket.auto_assigned', to: { assignedTo: superAdmin._id, role: 'super_admin' } }),
-        Notification.create({ userId: superAdmin._id, title: 'New ticket assigned', message: `${ticket.ticketNumber}: ${ticket.title}`, link: `/tickets/${ticket.id}` }),
-        AuditLog.create({ companyId: user.companyId, actor: user.id, action: 'ticket.assigned_to_super_admin', resource: 'ticket', resourceId: ticket.id, metadata: { assignedTo: superAdmin.id } }),
+        TicketHistory.create({ ticketId: ticket._id, actor: user.id, action: assignmentAction, to: { assignedTo: assignee._id, role: assignee.role, department: assignee.department } }),
+        Notification.create({ userId: assignee._id, title: 'New ticket assigned', message: `${ticket.ticketNumber}: ${ticket.title}`, link: `/tickets/${ticket.id}` }),
+        AuditLog.create({ companyId: user.companyId, actor: user.id, action: assignmentAction, resource: 'ticket', resourceId: ticket.id, metadata: { assignedTo: assignee.id, department } }),
       );
     }
     await Promise.all(work);
@@ -48,9 +56,13 @@ export const ticketService = {
   },
   async update(id: string, input: any, user: NonNullable<Express.Request['user']>) {
     const ticket = await Ticket.findOne({ _id: id, ...scoped(user) }); if (!ticket) throw new AppError(404, 'Ticket not found');
-    const managerial = MANAGER_ROLES.includes(user.role); const isCreator = ticket.createdBy.toString() === user.id;
-    if (!managerial && (!isCreator || !['open', 'resolved'].includes(ticket.status))) throw new AppError(403, 'Ticket cannot be changed');
-    const allowed = managerial ? ['title','description','category','department','priority','status','assignedTo','dueDate'] : ['title','description','feedback','status'];
+    const managerial = MANAGER_ROLES.includes(user.role);
+    const isCreator = ticket.createdBy.toString() === user.id;
+    const isAssignee = ticket.assignedTo?.toString() === user.id;
+    if (!managerial && !isCreator && !isAssignee) throw new AppError(403, 'Ticket cannot be changed');
+    if (!managerial && isAssignee && input.status && !['in_progress', 'pending', 'escalated', 'resolved'].includes(input.status)) throw new AppError(422, 'Assigned users can only start, pause, escalate, or resolve tickets', 'INVALID_STATUS');
+    if (!managerial && isCreator && !isAssignee && !['open', 'resolved'].includes(ticket.status)) throw new AppError(403, 'Only the assigned handler can update work in progress');
+    const allowed = managerial ? ['title','description','category','department','priority','status','assignedTo','dueDate'] : isAssignee ? ['status'] : ['title','description','feedback','status'];
     const before = ticket.toObject(); for (const key of allowed) if (input[key] !== undefined) ticket.set(key, input[key]);
     if (input.status === 'resolved') ticket.resolvedAt = new Date(); if (input.status === 'closed') ticket.closedAt = new Date(); await ticket.save();
     await TicketHistory.create({ ticketId: id, actor: user.id, action: 'ticket.updated', from: before, to: ticket.toObject() });
@@ -59,7 +71,8 @@ export const ticketService = {
   },
   async comment(id: string, body: string, internal: boolean, user: NonNullable<Express.Request['user']>) {
     const ticket = await Ticket.findOne({ _id: id, ...scoped(user) }); if (!ticket) throw new AppError(404, 'Ticket not found');
-    if (internal && user.role === 'employee') throw new AppError(403, 'Internal comments require staff access');
+    const assignedHandler = ticket.assignedTo?.toString() === user.id;
+    if (internal && user.role === 'employee' && !assignedHandler) throw new AppError(403, 'Internal comments require handler access');
     const comment = await TicketComment.create({ ticketId: id, author: user.id, body, internal });
     await TicketHistory.create({ ticketId: id, actor: user.id, action: internal ? 'comment.internal' : 'comment.public' });
     return TicketComment.findById(comment._id).populate('author', 'name role');
